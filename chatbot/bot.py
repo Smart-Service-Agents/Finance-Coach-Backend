@@ -1,109 +1,106 @@
 import os
 import json
+import numpy as np
+import faiss
 from django.conf import settings
 
 
 class FinanceCoach:
     def __init__(self):
-        self.BASE_DIR = settings.BASE_DIR
-        self.model_path = os.path.join(self.BASE_DIR, "chatbot", "hotel_llm")
-        self.dataset_path = os.path.join(self.BASE_DIR, "chatbot", "dataset.json")
+        # Paths
+        self.BASE_DIR      = settings.BASE_DIR
+        self.dataset_path  = os.path.join(self.BASE_DIR, "chatbot", "dataset.json")
+        # Gemini API key
+        self.GEMINI        = os.getenv("Gemini_Key")
 
-        self.GEMINI = os.getenv("Gemini_Key")
+        # Lazy‐initialized attributes
+        self.embedder      = None      # SentenceTransformer
+        self.index         = None      # FAISS index
+        self.transcripts   = None      # List of transcript strings
+        self.video_links   = None      # List of corresponding video URLs
+        self.dataset_loaded = False
 
-        print(self.GEMINI)
+    def _load_dataset_and_index(self):
+        """
+        Load JSON dataset of {transcript, video} pairs, build an embedding index.
+        This runs only once on first call to answer_question().
+        """
+        if self.dataset_loaded:
+            return
 
-        # All heavy components start as None and load on demand
-        self.tokenizer = None
-        self.model = None
-        self.generator = None
-        self.embedder = None
-        self.index = None
-        self.dataset = None
-        self.video_links = None
+        # 1) Read dataset.json
+        with open(self.dataset_path, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
 
-    def _load_generator(self):
-        if self.generator is None:
-            # Import here so it doesn’t block startup
-            from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+        # 2) Extract transcripts & video URLs
+        self.transcripts = [entry["transcript"] for entry in raw_data]
+        self.video_links = [entry["video"]      for entry in raw_data]
 
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(self.model_path)
-            self.generator = pipeline(
-                "text2text-generation",
-                model=self.model,
-                tokenizer=self.tokenizer
-            )
+        # 3) Lazy‐import SentenceTransformer
+        from sentence_transformers import SentenceTransformer
+        self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
-    def _load_embedder(self):
-        if self.embedder is None:
-            # Import here for SentenceTransformer
-            from sentence_transformers import SentenceTransformer
+        # 4) Encode all transcripts to 384-dimensional vectors
+        all_embeddings = self.embedder.encode(self.transcripts, convert_to_numpy=True).astype(np.float32)
 
-            self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        # 5) Build a FAISS index (Flat L2 on 384 dims)
+        self.index = faiss.IndexFlatL2(384)
+        self.index.add(all_embeddings)
 
-    def _load_dataset(self):
-        if self.dataset is None:
-            # Lazy load dataset JSON
-            with open(self.dataset_path, "r", encoding="utf-8") as file:
-                self.dataset = json.load(file)
+        self.dataset_loaded = True
 
-            # Now load the embedder and build FAISS index
-            self._load_embedder()
+    def _find_best_match(self, question: str):
+        """
+        Return (best_transcript, best_video_url) by finding nearest neighbor in FAISS.
+        """
+        self._load_dataset_and_index()
+        # 1) Embed question
+        q_emb = self.embedder.encode(question, convert_to_numpy=True).astype(np.float32).reshape(1, -1)
+        # 2) Search the single nearest neighbor
+        _, idxs = self.index.search(q_emb, 1)
+        best_idx = int(idxs[0][0])
+        return self.transcripts[best_idx], self.video_links[best_idx]
 
-            # Import numpy and faiss on demand
-            import numpy as np
-            import faiss
-
-            # Create a flat L2 index for 384-dimensional embeddings
-            self.index = faiss.IndexFlatL2(384)
-            self.video_links = []
-
-            for entry in self.dataset:
-                text_embedding = self.embedder.encode(entry["transcript"]).astype(np.float32)
-                self.index.add(text_embedding.reshape(1, -1))
-                self.video_links.append(entry["video"])
-
-    def retrieve_best_transcript(self, question):
-        # Ensure the dataset, embedder, and index are loaded
-        self._load_dataset()
-        import numpy as np
-
-        question_embedding = self.embedder.encode(question).astype(np.float32).reshape(1, -1)
-        _, best_match = self.index.search(question_embedding, 1)
-        best_index = int(best_match[0][0])
-        return self.dataset[best_index]["transcript"], self.video_links[best_index]
-
-    def generate_prompt(self, prompt):
-        # Lazy import and configure Google Generative AI
+    def _generate_with_gemini(self, prompt: str) -> str:
+        """
+        Lazy‐import and call Google Gemini to refine the answer.
+        """
         import google.generativeai as genai
-
         genai.configure(api_key=self.GEMINI)
         model = genai.GenerativeModel("gemini-2.0-flash")
-
         response = model.generate_content(prompt)
         return response.text
 
-    def answer_question(self, question):
-        # Ensure the generator (transformers pipeline) is loaded
-        self._load_generator()
+    def answer_question(self, question: str) -> dict:
+        """
+        1. Find best matching transcript + video link from dataset.
+        2. Build a Gemini prompt that asks for a concise, hotel‐finance‐oriented answer.
+        3. Return { "answer": <gemini_output>, "video": <video_url> }.
+        """
+        # 1) Find best transcript/video
+        best_transcript, video_url = self._find_best_match(question)
 
-        # Retrieve context from dataset via FAISS
-        best_transcript, video_link = self.retrieve_best_transcript(question)
-        prompt_for_transformer = f"Context: {best_transcript} Question: {question} Answer:"
-
-        # Run the local seq2seq model
-        result = self.generator(prompt_for_transformer, max_length=100)
-        chunk = result[0]["generated_text"]
-
-        # Build a second prompt for Gemini
-        final_prompt = (
-            f"You are an expert hotel finance analyst. "
-            f"Analyze the question: {question}\n\n"
-            f"Use this chunk from your database: {chunk}"
+        # 2) Construct a prompt for Gemini to turn transcript snippet into a proper response
+        gemini_prompt = (
+            "You are an expert hotel finance assistant.\n"
+            f"Context excerpt:\n\"\"\"\n{best_transcript}\n\"\"\"\n\n"
+            f"User question: \"{question}\"\n\n"
+            "Provide a concise, professional answer based on the excerpt above. "
+            "If the excerpt does not fully answer the question, combine its information "
+            "with best practices in hotel finance and explain clearly."
         )
 
-        # Get the final answer via Google Generative AI
-        answer = self.generate_prompt(final_prompt)
+        # 3) Call Gemini
+        try:
+            refined_answer = self._generate_with_gemini(gemini_prompt)
+        except Exception as e:
+            # If Gemini call fails, fall back to returning the raw transcript
+            refined_answer = (
+                "Error refining answer with Gemini; here is the closest context:\n\n"
+                f"{best_transcript}"
+            )
 
-        return {"answer": answer, "video": video_link}
+        return {
+            "answer": refined_answer,
+            "video": video_url
+        }
